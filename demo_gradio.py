@@ -30,7 +30,7 @@ from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
-from diffusers_helper.bucket_tools import find_nearest_bucket
+from diffusers_helper.bucket_tools import find_nearest_bucket, bucket_options
 
 
 parser = argparse.ArgumentParser()
@@ -184,7 +184,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
 
         H, W, C = input_image.shape
-        height, width = find_nearest_bucket(H, W, resolution=resolution)
+
+        # Adjust resolution to nearest bucket
+        res_keys = list(bucket_options.keys())
+        if resolution not in res_keys:
+            resolution_key = min(res_keys, key=lambda x: abs(x - resolution))
+        else:
+            resolution_key = resolution
+
+        height, width = find_nearest_bucket(H, W, resolution=resolution_key)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
 
         Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
