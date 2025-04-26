@@ -6,12 +6,17 @@ os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.di
 
 import gradio as gr
 import torch
+torch.backends.cudnn.benchmark = True  # Enable cudnn auto-tuning for better performance
+torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for matmul (GPU)
+torch.backends.cudnn.allow_tf32 = True  # Enable TF32 for convolutions
+import contextlib  # For mixed precision context
 import traceback
 import einops
 import safetensors.torch as sf
 import numpy as np
 import argparse
 import math
+from torch.cuda.amp import autocast
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -33,6 +38,13 @@ parser.add_argument('--share', action='store_true')
 parser.add_argument("--server", type=str, default='0.0.0.0')
 parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
+parser.add_argument('--resolution', type=int, default=640, help='Target resolution (will use nearest bucket)')
+parser.add_argument('--fps', type=int, default=30, help='FPS for output video')
+parser.add_argument('--teacache_steps', type=int, default=25, help='TeaCache initialization steps')
+parser.add_argument('--teacache_thresh', type=float, default=0.15, help='TeaCache relative L1 threshold (higher → faster, more loss)')
+parser.add_argument('--compile_model', action='store_true', help='Compile transformer with torch.compile for speed (PyTorch>=2.0)')
+parser.add_argument('--use_xformers', action='store_true', help='Enable xFormers memory-efficient attention if available')
+parser.add_argument('--use_amp', action='store_true', help='Use mixed precision autocast during sampling')
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -56,6 +68,29 @@ feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_
 image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
 transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+# Compile and optimize transformer
+if args.compile_model and hasattr(torch, 'compile'):
+    print('Compiling transformer model with torch.compile()')
+    transformer = torch.compile(transformer)
+# Use channels_last memory format for best performance (if supported)
+with contextlib.suppress(Exception):
+    transformer = transformer.to(memory_format=torch.channels_last)
+# Enable xFormers if requested
+if args.use_xformers:
+    try:
+        transformer.enable_xformers_memory_efficient_attention()
+        print('xFormers memory-efficient attention enabled')
+    except Exception:
+        print('Failed to enable xFormers attention, continuing without it')
+# Apply channels_last format to models where supported
+with contextlib.suppress(Exception):
+    vae = vae.to(memory_format=torch.channels_last)
+with contextlib.suppress(Exception):
+    image_encoder = image_encoder.to(memory_format=torch.channels_last)
+with contextlib.suppress(Exception):
+    text_encoder = text_encoder.to(memory_format=torch.channels_last)
+with contextlib.suppress(Exception):
+    text_encoder_2 = text_encoder_2.to(memory_format=torch.channels_last)
 
 vae.eval()
 text_encoder.eval()
@@ -66,6 +101,15 @@ transformer.eval()
 if not high_vram:
     vae.enable_slicing()
     vae.enable_tiling()
+    # Further memory optimizations for low VRAM
+    with contextlib.suppress(Exception):
+        vae.enable_attention_slicing()
+    with contextlib.suppress(Exception):
+        image_encoder.enable_attention_slicing()
+    with contextlib.suppress(Exception):
+        text_encoder.enable_attention_slicing()
+    with contextlib.suppress(Exception):
+        text_encoder_2.enable_attention_slicing()
 
 transformer.high_quality_fp32_output_for_inference = True
 print('transformer.high_quality_fp32_output_for_inference = True')
@@ -98,11 +142,13 @@ stream = AsyncStream()
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
+prompt_cache = {}
+image_cache = {}
+
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
-    total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
-    total_latent_sections = int(max(round(total_latent_sections), 1))
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, teacache_steps, teacache_thresh, mp4_crf, resolution, fps):
+    total_latent_sections = int(max(round((total_second_length * fps) / (latent_window_size * 4)), 1))
 
     job_id = generate_timestamp()
 
@@ -138,7 +184,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
 
         H, W, C = input_image.shape
-        height, width = find_nearest_bucket(H, W, resolution=640)
+        height, width = find_nearest_bucket(H, W, resolution=resolution)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
 
         Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
@@ -216,7 +262,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
             if use_teacache:
-                transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
+                transformer.initialize_teacache(enable_teacache=True, num_steps=teacache_steps, rel_l1_thresh=teacache_thresh)
             else:
                 transformer.initialize_teacache(enable_teacache=False)
 
@@ -234,7 +280,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 current_step = d['i'] + 1
                 percentage = int(100.0 * current_step / steps)
                 hint = f'Sampling {current_step}/{steps}'
-                desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
+                desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / fps) :.2f} seconds (FPS-{fps}). The video is being extended now ...'
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                 return
 
@@ -295,7 +341,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
 
-            save_bcthw_as_mp4(history_pixels, output_filename, fps=30, crf=mp4_crf)
+            save_bcthw_as_mp4(history_pixels, output_filename, fps=fps, crf=mp4_crf)
 
             print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
 
@@ -315,7 +361,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, teacache_steps, teacache_thresh, mp4_crf, resolution, fps):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -323,7 +369,7 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf)
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, teacache_steps, teacache_thresh, mp4_crf, resolution, fps)
 
     output_filename = None
 
@@ -361,6 +407,7 @@ with block:
     with gr.Row():
         with gr.Column():
             input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
+            resolution = gr.Slider(label="Resolution", minimum=64, maximum=2048, step=16, value=args.resolution, info="Target resolution for resizing (uses nearest bucket)")
             prompt = gr.Textbox(label="Prompt", value='')
             example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
             example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
@@ -371,6 +418,8 @@ with block:
 
             with gr.Group():
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
+                teacache_steps = gr.Slider(label="TeaCache Steps", minimum=1, maximum=100, step=1, value=args.teacache_steps, info="Número de pasos para inicializar TeaCache (ajusta memoria/velocidad)")
+                teacache_thresh = gr.Slider(label="TeaCache Threshold", minimum=0.05, maximum=0.5, step=0.05, value=args.teacache_thresh, info="Rel threshold para TeaCache (más alto→más rápido, más loss)")
 
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
                 seed = gr.Number(label="Seed", value=31337, precision=0)
@@ -386,6 +435,7 @@ with block:
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
 
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
+                fps = gr.Slider(label="FPS", minimum=1, maximum=60, step=1, value=args.fps)
 
         with gr.Column():
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
@@ -396,7 +446,7 @@ with block:
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, teacache_steps, teacache_thresh, mp4_crf, resolution, fps]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
